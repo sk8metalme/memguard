@@ -1,0 +1,28 @@
+# memguard 設定ファイル
+#
+# このファイルを ~/.memguardrc にコピーして使用してください
+# cp memguardrc.example ~/.memguardrc
+#
+
+# 空きメモリ閾値 (%)
+# この値以下になると対象プロセスを終了します
+THRESHOLD_PERCENT=10
+
+# チェック間隔 (秒)
+CHECK_INTERVAL=5
+
+# 対象プロセス (正規表現)
+# 複数指定する場合は | で区切ります
+TARGET_PROCESSES="claude|node"
+
+# ログファイルのパス
+LOG_FILE="$HOME/.memguard.log"
+
+# ログファイルの最大サイズ (MB)
+# この値を超えるとログローテーションが実行されます
+LOG_MAX_SIZE_MB=10
+
+# 通知の有効/無効
+# true: 通知を有効にする
+# false: 通知を無効にする
+NOTIFY_ENABLED=true

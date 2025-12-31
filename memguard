@@ -1,18 +1,33 @@
 #!/bin/bash
 #
 # memguard - macOS用メモリ監視デーモン (earlyoomライク)
-# 空きメモリが閾値以下になったらclaude/nodeプロセスを終了
+# 空きメモリが閾値以下になったら指定プロセスを自動終了
 #
 
-# === 設定 ===
-VERSION="1.0.0"
-THRESHOLD_PERCENT=10       # 空きメモリ閾値 (%)
-CHECK_INTERVAL=5           # チェック間隔 (秒)
+# === デフォルト設定 ===
+VERSION="1.1.0"
+THRESHOLD_PERCENT=10
+CHECK_INTERVAL=5
 LOG_FILE="$HOME/.memguard.log"
+LOG_MAX_SIZE_MB=10
 TARGET_PROCESSES="claude|node"
+NOTIFY_ENABLED=true
 PIDFILE="/tmp/memguard.pid"
+CONFIG_FILE="$HOME/.memguardrc"
+PLIST_FILE="$HOME/Library/LaunchAgents/local.memguard.plist"
 
-# === 関数 ===
+# グローバルフラグ
+DRY_RUN=false
+
+# === 設定ファイル読み込み ===
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+}
+
+# === ユーティリティ関数 ===
 
 # ログ出力 (ファイル + 標準出力)
 log() {
@@ -22,15 +37,41 @@ log() {
 
 # macOS通知を送信
 notify() {
+    if [ "$NOTIFY_ENABLED" = "false" ]; then
+        return
+    fi
+
     local title="$1"
     local message="$2"
     # エスケープ処理でコマンドインジェクションを防止
     local escaped_title
     local escaped_message
-    escaped_title=$(printf '%s' "$title" | sed 's/"/\\"/g; s/\\/\\\\/g')
-    escaped_message=$(printf '%s' "$message" | sed 's/"/\\"/g; s/\\/\\\\/g')
-    osascript -e "display notification \"$escaped_message\" with title \"$escaped_title\" sound name \"Basso\""
+    escaped_title=$(printf '%s' "$title" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    escaped_message=$(printf '%s' "$message" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    osascript -e "display notification \"$escaped_message\" with title \"$escaped_title\" sound name \"Basso\"" 2>/dev/null
 }
+
+# ログローテーション
+rotate_logs() {
+    if [ ! -f "$LOG_FILE" ]; then
+        return
+    fi
+
+    # ログファイルサイズをMBで取得
+    local log_size_mb
+    log_size_mb=$(du -m "$LOG_FILE" | awk '{print $1}')
+
+    if [ "$log_size_mb" -ge "$LOG_MAX_SIZE_MB" ]; then
+        # ローテーション
+        [ -f "${LOG_FILE}.2" ] && rm -f "${LOG_FILE}.2"
+        [ -f "${LOG_FILE}.1" ] && mv "${LOG_FILE}.1" "${LOG_FILE}.2"
+        mv "$LOG_FILE" "${LOG_FILE}.1"
+        touch "$LOG_FILE"
+        log "[INFO] ログローテーション実行 (${log_size_mb}MB → 0MB)"
+    fi
+}
+
+# === メモリ関連関数 ===
 
 # メモリ統計を取得 (ページ数とバイト数)
 # グローバル変数に結果を格納
@@ -105,6 +146,31 @@ get_memory_info() {
     echo "${available_mb}MB / ${total_mb}MB"
 }
 
+# === プロセス管理関数 ===
+
+# 対象プロセスを一覧表示（読み取り専用）
+list_target_processes() {
+    local count=0
+
+    # claude/nodeプロセスをメモリ使用量順で取得
+    local pids
+    pids=$(ps aux | grep -E "$TARGET_PROCESSES" | grep -v grep | sort -k4 -nr | awk '{print $2}')
+
+    for pid in $pids; do
+        local proc_name
+        local mem_percent
+        proc_name=$(ps -p "$pid" -o comm= 2>/dev/null)
+        mem_percent=$(ps -p "$pid" -o %mem= 2>/dev/null | tr -d ' ')
+
+        if [ -n "$proc_name" ]; then
+            echo "  - $proc_name (PID: $pid) - Memory: ${mem_percent}%"
+            count=$((count + 1))
+        fi
+    done
+
+    return "$count"
+}
+
 # 対象プロセスを終了
 kill_target_processes() {
     local killed=0
@@ -120,16 +186,20 @@ kill_target_processes() {
         mem_percent=$(ps -p "$pid" -o %mem= 2>/dev/null | tr -d ' ')
 
         if [ -n "$proc_name" ]; then
-            log "[KILL] PID $pid ($proc_name) - Memory: ${mem_percent}%"
+            if [ "$DRY_RUN" = "true" ]; then
+                echo "  - $proc_name (PID: $pid) - Memory: ${mem_percent}%"
+            else
+                log "[KILL] PID $pid ($proc_name) - Memory: ${mem_percent}%"
 
-            # まずSIGTERMで優しく終了要求
-            kill -TERM "$pid" 2>/dev/null
-            sleep 2
+                # まずSIGTERMで優しく終了要求
+                kill -TERM "$pid" 2>/dev/null
+                sleep 2
 
-            # まだ生きていたらSIGKILLで強制終了
-            if ps -p "$pid" > /dev/null 2>&1; then
-                kill -KILL "$pid" 2>/dev/null
-                log "[KILL] PID $pid をSIGKILLで強制終了"
+                # まだ生きていたらSIGKILLで強制終了
+                if ps -p "$pid" > /dev/null 2>&1; then
+                    kill -KILL "$pid" 2>/dev/null
+                    log "[KILL] PID $pid をSIGKILLで強制終了"
+                fi
             fi
 
             killed=$((killed + 1))
@@ -154,58 +224,300 @@ check_already_running() {
         old_pid=$(cat "$PIDFILE" 2>/dev/null)
         if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
             echo "ERROR: memguard is already running (PID: $old_pid)" >&2
-            exit 1
+            return 1
         fi
         # 古いPIDファイルを削除
         rm -f "$PIDFILE"
     fi
     # 現在のPIDを記録
     echo $$ > "$PIDFILE"
+    return 0
+}
+
+# === CLIコマンド関数 ===
+
+cmd_help() {
+    cat <<EOF
+memguard v${VERSION} - macOS用メモリ監視デーモン
+
+使用法:
+  memguard [コマンド] [オプション]
+
+コマンド:
+  start       デーモンを起動
+  stop        デーモンを停止
+  restart     デーモンを再起動
+  status      現在の状態を表示
+  check       メモリ状態をチェック（ワンショット）
+  config      現在の設定を表示
+  logs        ログをリアルタイム表示
+  version     バージョン表示
+  help        このヘルプを表示
+
+オプション:
+  --dry-run   ドライランモード（checkコマンドで使用）
+  --verbose   詳細表示（checkコマンドで使用）
+
+例:
+  memguard start              # デーモン起動
+  memguard status             # 状態確認
+  memguard check              # メモリチェック
+  memguard check --verbose    # 詳細なメモリチェック
+  memguard check --dry-run    # ドライランでチェック
+  memguard logs               # ログ表示
+
+設定ファイル:
+  ~/.memguardrc
+
+詳細: https://github.com/your-repo/memguard
+EOF
+}
+
+cmd_version() {
+    echo "memguard version ${VERSION}"
+}
+
+cmd_config() {
+    echo "=========================================="
+    echo "memguard v${VERSION} - 現在の設定"
+    echo "=========================================="
+    echo "閾値: ${THRESHOLD_PERCENT}%"
+    echo "チェック間隔: ${CHECK_INTERVAL}秒"
+    echo "対象プロセス: ${TARGET_PROCESSES}"
+    echo "ログファイル: ${LOG_FILE}"
+    echo "ログ最大サイズ: ${LOG_MAX_SIZE_MB}MB"
+    echo "通知: $([ "$NOTIFY_ENABLED" = "true" ] && echo '有効' || echo '無効')"
+    echo "PIDファイル: ${PIDFILE}"
+    echo "設定ファイル: ${CONFIG_FILE}"
+    echo "=========================================="
+}
+
+cmd_status() {
+    if [ -f "$PIDFILE" ]; then
+        local daemon_pid
+        daemon_pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+            echo "memguard v${VERSION} - 実行中 (PID: $daemon_pid)"
+        else
+            echo "memguard v${VERSION} - 停止中 (PIDファイルが残っています)"
+            return 1
+        fi
+    else
+        echo "memguard v${VERSION} - 停止中"
+        return 1
+    fi
+
+    # メモリ情報表示
+    local free_percent
+    local mem_info
+    free_percent=$(get_free_memory_percent)
+    mem_info=$(get_memory_info)
+    echo "空きメモリ: ${free_percent}% (${mem_info})"
+
+    # 対象プロセス数
+    local target_count
+    target_count=$(pgrep -f "$TARGET_PROCESSES" 2>/dev/null | wc -l | tr -d ' ')
+    echo "対象プロセス: ${target_count}個"
+    echo "閾値: ${THRESHOLD_PERCENT}%"
+}
+
+cmd_check() {
+    local verbose=false
+    local show_dry_run=false
+
+    # オプション解析
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --verbose|-v)
+                verbose=true
+                shift
+                ;;
+            --dry-run)
+                show_dry_run=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # メモリ情報取得
+    local free_percent
+    local mem_info
+    free_percent=$(get_free_memory_percent)
+    mem_info=$(get_memory_info)
+
+    echo "空きメモリ: ${free_percent}% (${mem_info})"
+
+    if [ "$free_percent" -lt "$THRESHOLD_PERCENT" ]; then
+        echo "状態: WARNING (閾値${THRESHOLD_PERCENT}%以下)"
+    else
+        echo "状態: OK (閾値${THRESHOLD_PERCENT}%を上回っています)"
+    fi
+
+    # 詳細表示（読み取り専用 - プロセスは終了しない）
+    if [ "$verbose" = "true" ] || [ "$show_dry_run" = "true" ]; then
+        local target_count
+        target_count=$(pgrep -f "$TARGET_PROCESSES" 2>/dev/null | wc -l | tr -d ' ')
+
+        if [ "$target_count" -gt 0 ]; then
+            echo ""
+            if [ "$show_dry_run" = "true" ] && [ "$free_percent" -lt "$THRESHOLD_PERCENT" ]; then
+                echo "[DRY-RUN] 以下のプロセスを終了予定:"
+            else
+                echo "対象プロセス:"
+            fi
+            # 読み取り専用でプロセスをリスト表示（決して終了しない）
+            list_target_processes
+        fi
+    fi
+}
+
+cmd_start() {
+    # 既に実行中かチェック
+    if [ -f "$PIDFILE" ]; then
+        local daemon_pid
+        daemon_pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+            echo "ERROR: memguard is already running (PID: $daemon_pid)" >&2
+            return 1
+        fi
+    fi
+
+    # launchctlで起動
+    if [ -f "$PLIST_FILE" ]; then
+        launchctl load "$PLIST_FILE" 2>/dev/null
+        echo "memguard を起動しました"
+    else
+        echo "ERROR: plistファイルが見つかりません: $PLIST_FILE" >&2
+        echo "install-memguard.sh を実行してインストールしてください" >&2
+        return 1
+    fi
+}
+
+cmd_stop() {
+    if [ -f "$PLIST_FILE" ]; then
+        launchctl unload "$PLIST_FILE" 2>/dev/null
+        echo "memguard を停止しました"
+        rm -f "$PIDFILE"
+    else
+        echo "ERROR: plistファイルが見つかりません: $PLIST_FILE" >&2
+        return 1
+    fi
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_logs() {
+    if [ -f "$LOG_FILE" ]; then
+        tail -f "$LOG_FILE"
+    else
+        echo "ERROR: ログファイルが見つかりません: $LOG_FILE" >&2
+        return 1
+    fi
+}
+
+# === デーモンモード ===
+
+run_daemon() {
+    # シグナルハンドリング設定
+    trap cleanup SIGTERM SIGINT EXIT
+
+    # 多重起動チェック
+    if ! check_already_running; then
+        exit 1
+    fi
+
+    log "=========================================="
+    log "memguard v${VERSION} 開始"
+    log "閾値: ${THRESHOLD_PERCENT}%, 間隔: ${CHECK_INTERVAL}秒"
+    log "対象プロセス: $TARGET_PROCESSES"
+    log "=========================================="
+
+    notify "memguard" "メモリ監視を開始しました (閾値: ${THRESHOLD_PERCENT}%)"
+
+    while true; do
+        # ログローテーション
+        rotate_logs
+
+        free_percent=$(get_free_memory_percent)
+
+        if [ "$free_percent" -lt "$THRESHOLD_PERCENT" ]; then
+            mem_info=$(get_memory_info)
+            log "[WARNING] 空きメモリ低下: ${free_percent}% ($mem_info)"
+
+            # 対象プロセスを検索
+            target_count=$(pgrep -f "$TARGET_PROCESSES" 2>/dev/null | wc -l | tr -d ' ')
+
+            if [ "$target_count" -gt 0 ]; then
+                log "[ACTION] claude/nodeプロセス ${target_count}個を終了します"
+                notify "⚠️ memguard" "メモリ不足 (${free_percent}%) - claude/nodeを終了します"
+
+                killed=$(kill_target_processes)
+
+                if [ "$killed" -gt 0 ]; then
+                    sleep 2
+                    new_free=$(get_free_memory_percent)
+                    new_info=$(get_memory_info)
+                    log "[RESULT] ${killed}個のプロセスを終了 - 空きメモリ: ${new_free}% ($new_info)"
+                    notify "✅ memguard" "${killed}個のプロセスを終了しました (空き: ${new_free}%)"
+                fi
+            else
+                log "[INFO] 対象プロセス(claude/node)なし - スキップ"
+            fi
+        fi
+
+        sleep "$CHECK_INTERVAL"
+    done
 }
 
 # === メイン処理 ===
 
-# シグナルハンドリング設定
-trap cleanup SIGTERM SIGINT EXIT
+# 設定ファイル読み込み
+load_config
 
-# 多重起動チェック
-check_already_running
-
-log "=========================================="
-log "memguard v${VERSION} 開始"
-log "閾値: ${THRESHOLD_PERCENT}%, 間隔: ${CHECK_INTERVAL}秒"
-log "対象プロセス: $TARGET_PROCESSES"
-log "=========================================="
-
-notify "memguard" "メモリ監視を開始しました (閾値: ${THRESHOLD_PERCENT}%)"
-
-while true; do
-    free_percent=$(get_free_memory_percent)
-    
-    if [ "$free_percent" -lt "$THRESHOLD_PERCENT" ]; then
-        mem_info=$(get_memory_info)
-        log "[WARNING] 空きメモリ低下: ${free_percent}% ($mem_info)"
-        
-        # 対象プロセスを検索
-        target_count=$(pgrep -f "$TARGET_PROCESSES" 2>/dev/null | wc -l | tr -d ' ')
-        
-        if [ "$target_count" -gt 0 ]; then
-            log "[ACTION] claude/nodeプロセス ${target_count}個を終了します"
-            notify "⚠️ memguard" "メモリ不足 (${free_percent}%) - claude/nodeを終了します"
-            
-            killed=$(kill_target_processes)
-            
-            if [ "$killed" -gt 0 ]; then
-                sleep 2
-                new_free=$(get_free_memory_percent)
-                new_info=$(get_memory_info)
-                log "[RESULT] ${killed}個のプロセスを終了 - 空きメモリ: ${new_free}% ($new_info)"
-                notify "✅ memguard" "${killed}個のプロセスを終了しました (空き: ${new_free}%)"
-            fi
-        else
-            log "[INFO] 対象プロセス(claude/node)なし - スキップ"
-        fi
-    fi
-    
-    sleep $CHECK_INTERVAL
-done
+# コマンド解析
+case "${1:-daemon}" in
+    start)
+        cmd_start
+        ;;
+    stop)
+        cmd_stop
+        ;;
+    restart)
+        cmd_restart
+        ;;
+    status)
+        cmd_status
+        ;;
+    check)
+        shift
+        cmd_check "$@"
+        ;;
+    config)
+        cmd_config
+        ;;
+    logs)
+        cmd_logs
+        ;;
+    version|--version|-v)
+        cmd_version
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    daemon)
+        # デーモンモード（引数なしで実行された場合）
+        run_daemon
+        ;;
+    *)
+        echo "ERROR: 不明なコマンド: $1" >&2
+        echo "ヘルプを表示: memguard help" >&2
+        exit 1
+        ;;
+esac
