@@ -148,6 +148,29 @@ get_memory_info() {
 
 # === プロセス管理関数 ===
 
+# 対象プロセスを一覧表示（読み取り専用）
+list_target_processes() {
+    local count=0
+
+    # claude/nodeプロセスをメモリ使用量順で取得
+    local pids
+    pids=$(ps aux | grep -E "$TARGET_PROCESSES" | grep -v grep | sort -k4 -nr | awk '{print $2}')
+
+    for pid in $pids; do
+        local proc_name
+        local mem_percent
+        proc_name=$(ps -p "$pid" -o comm= 2>/dev/null)
+        mem_percent=$(ps -p "$pid" -o %mem= 2>/dev/null | tr -d ' ')
+
+        if [ -n "$proc_name" ]; then
+            echo "  - $proc_name (PID: $pid) - Memory: ${mem_percent}%"
+            count=$((count + 1))
+        fi
+    done
+
+    return "$count"
+}
+
 # 対象プロセスを終了
 kill_target_processes() {
     local killed=0
@@ -300,6 +323,7 @@ cmd_status() {
 
 cmd_check() {
     local verbose=false
+    local show_dry_run=false
 
     # オプション解析
     while [ $# -gt 0 ]; do
@@ -309,7 +333,7 @@ cmd_check() {
                 shift
                 ;;
             --dry-run)
-                DRY_RUN=true
+                show_dry_run=true
                 shift
                 ;;
             *)
@@ -332,20 +356,20 @@ cmd_check() {
         echo "状態: OK (閾値${THRESHOLD_PERCENT}%を上回っています)"
     fi
 
-    # 詳細表示
-    if [ "$verbose" = "true" ] || [ "$DRY_RUN" = "true" ]; then
+    # 詳細表示（読み取り専用 - プロセスは終了しない）
+    if [ "$verbose" = "true" ] || [ "$show_dry_run" = "true" ]; then
         local target_count
         target_count=$(pgrep -f "$TARGET_PROCESSES" 2>/dev/null | wc -l | tr -d ' ')
 
         if [ "$target_count" -gt 0 ]; then
             echo ""
-            if [ "$DRY_RUN" = "true" ] && [ "$free_percent" -lt "$THRESHOLD_PERCENT" ]; then
+            if [ "$show_dry_run" = "true" ] && [ "$free_percent" -lt "$THRESHOLD_PERCENT" ]; then
                 echo "[DRY-RUN] 以下のプロセスを終了予定:"
-                kill_target_processes
             else
                 echo "対象プロセス:"
-                kill_target_processes > /dev/null
             fi
+            # 読み取り専用でプロセスをリスト表示（決して終了しない）
+            list_target_processes
         fi
     fi
 }
