@@ -1,0 +1,211 @@
+#!/bin/bash
+#
+# memguard - macOS用メモリ監視デーモン (earlyoomライク)
+# 空きメモリが閾値以下になったらclaude/nodeプロセスを終了
+#
+
+# === 設定 ===
+VERSION="1.0.0"
+THRESHOLD_PERCENT=10       # 空きメモリ閾値 (%)
+CHECK_INTERVAL=5           # チェック間隔 (秒)
+LOG_FILE="$HOME/.memguard.log"
+TARGET_PROCESSES="claude|node"
+PIDFILE="/tmp/memguard.pid"
+
+# === 関数 ===
+
+# ログ出力 (ファイル + 標準出力)
+log() {
+    local message="$(date '+%Y-%m-%d %H:%M:%S') $1"
+    echo "$message" | tee -a "$LOG_FILE"
+}
+
+# macOS通知を送信
+notify() {
+    local title="$1"
+    local message="$2"
+    # エスケープ処理でコマンドインジェクションを防止
+    local escaped_title
+    local escaped_message
+    escaped_title=$(printf '%s' "$title" | sed 's/"/\\"/g; s/\\/\\\\/g')
+    escaped_message=$(printf '%s' "$message" | sed 's/"/\\"/g; s/\\/\\\\/g')
+    osascript -e "display notification \"$escaped_message\" with title \"$escaped_title\" sound name \"Basso\""
+}
+
+# メモリ統計を取得 (ページ数とバイト数)
+# グローバル変数に結果を格納
+get_memory_stats() {
+    # エラーハンドリング付きでページサイズを取得
+    MEM_PAGE_SIZE=$(pagesize 2>/dev/null)
+    if [ -z "$MEM_PAGE_SIZE" ]; then
+        log "[ERROR] pagesize コマンドの実行に失敗"
+        return 1
+    fi
+
+    # エラーハンドリング付きでvm_statを取得
+    local vm_stat_output
+    vm_stat_output=$(vm_stat 2>/dev/null)
+    if [ -z "$vm_stat_output" ]; then
+        log "[ERROR] vm_stat コマンドの実行に失敗"
+        return 1
+    fi
+
+    # エラーハンドリング付きで総物理メモリを取得
+    MEM_TOTAL_BYTES=$(sysctl -n hw.memsize 2>/dev/null)
+    if [ -z "$MEM_TOTAL_BYTES" ]; then
+        log "[ERROR] sysctl コマンドの実行に失敗"
+        return 1
+    fi
+
+    # 各種ページ数を取得
+    local free_pages
+    local inactive_pages
+    local speculative_pages
+    local purgeable_pages
+    free_pages=$(echo "$vm_stat_output" | awk '/Pages free/ {gsub(/\./,"",$3); print $3}')
+    inactive_pages=$(echo "$vm_stat_output" | awk '/Pages inactive/ {gsub(/\./,"",$3); print $3}')
+    speculative_pages=$(echo "$vm_stat_output" | awk '/Pages speculative/ {gsub(/\./,"",$3); print $3}')
+    purgeable_pages=$(echo "$vm_stat_output" | awk '/Pages purgeable/ {gsub(/\./,"",$3); print $3}')
+
+    # デフォルト値設定（取得失敗時）
+    free_pages=${free_pages:-0}
+    inactive_pages=${inactive_pages:-0}
+    speculative_pages=${speculative_pages:-0}
+    purgeable_pages=${purgeable_pages:-0}
+
+    # 利用可能メモリ = free + inactive + speculative + purgeable
+    MEM_AVAILABLE_PAGES=$((free_pages + inactive_pages + speculative_pages + purgeable_pages))
+    MEM_AVAILABLE_BYTES=$((MEM_AVAILABLE_PAGES * MEM_PAGE_SIZE))
+
+    return 0
+}
+
+# 空きメモリ割合を取得 (%)
+get_free_memory_percent() {
+    if ! get_memory_stats; then
+        echo "0"
+        return 1
+    fi
+
+    # パーセント計算
+    local percent=$((MEM_AVAILABLE_BYTES * 100 / MEM_TOTAL_BYTES))
+    echo "$percent"
+}
+
+# メモリ情報を人間が読める形式で取得
+get_memory_info() {
+    if ! get_memory_stats; then
+        echo "N/A"
+        return 1
+    fi
+
+    local available_mb=$((MEM_AVAILABLE_BYTES / 1024 / 1024))
+    local total_mb=$((MEM_TOTAL_BYTES / 1024 / 1024))
+
+    echo "${available_mb}MB / ${total_mb}MB"
+}
+
+# 対象プロセスを終了
+kill_target_processes() {
+    local killed=0
+
+    # claude/nodeプロセスをメモリ使用量順で取得
+    local pids
+    pids=$(ps aux | grep -E "$TARGET_PROCESSES" | grep -v grep | sort -k4 -nr | awk '{print $2}')
+
+    for pid in $pids; do
+        local proc_name
+        local mem_percent
+        proc_name=$(ps -p "$pid" -o comm= 2>/dev/null)
+        mem_percent=$(ps -p "$pid" -o %mem= 2>/dev/null | tr -d ' ')
+
+        if [ -n "$proc_name" ]; then
+            log "[KILL] PID $pid ($proc_name) - Memory: ${mem_percent}%"
+
+            # まずSIGTERMで優しく終了要求
+            kill -TERM "$pid" 2>/dev/null
+            sleep 2
+
+            # まだ生きていたらSIGKILLで強制終了
+            if ps -p "$pid" > /dev/null 2>&1; then
+                kill -KILL "$pid" 2>/dev/null
+                log "[KILL] PID $pid をSIGKILLで強制終了"
+            fi
+
+            killed=$((killed + 1))
+        fi
+    done
+
+    echo "$killed"
+}
+
+# クリーンアップ処理
+cleanup() {
+    log "memguard 終了 (シグナル受信)"
+    notify "memguard" "メモリ監視を停止しました"
+    rm -f "$PIDFILE"
+    exit 0
+}
+
+# 多重起動チェック
+check_already_running() {
+    if [ -f "$PIDFILE" ]; then
+        local old_pid
+        old_pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "ERROR: memguard is already running (PID: $old_pid)" >&2
+            exit 1
+        fi
+        # 古いPIDファイルを削除
+        rm -f "$PIDFILE"
+    fi
+    # 現在のPIDを記録
+    echo $$ > "$PIDFILE"
+}
+
+# === メイン処理 ===
+
+# シグナルハンドリング設定
+trap cleanup SIGTERM SIGINT EXIT
+
+# 多重起動チェック
+check_already_running
+
+log "=========================================="
+log "memguard v${VERSION} 開始"
+log "閾値: ${THRESHOLD_PERCENT}%, 間隔: ${CHECK_INTERVAL}秒"
+log "対象プロセス: $TARGET_PROCESSES"
+log "=========================================="
+
+notify "memguard" "メモリ監視を開始しました (閾値: ${THRESHOLD_PERCENT}%)"
+
+while true; do
+    free_percent=$(get_free_memory_percent)
+    
+    if [ "$free_percent" -lt "$THRESHOLD_PERCENT" ]; then
+        mem_info=$(get_memory_info)
+        log "[WARNING] 空きメモリ低下: ${free_percent}% ($mem_info)"
+        
+        # 対象プロセスを検索
+        target_count=$(pgrep -f "$TARGET_PROCESSES" 2>/dev/null | wc -l | tr -d ' ')
+        
+        if [ "$target_count" -gt 0 ]; then
+            log "[ACTION] claude/nodeプロセス ${target_count}個を終了します"
+            notify "⚠️ memguard" "メモリ不足 (${free_percent}%) - claude/nodeを終了します"
+            
+            killed=$(kill_target_processes)
+            
+            if [ "$killed" -gt 0 ]; then
+                sleep 2
+                new_free=$(get_free_memory_percent)
+                new_info=$(get_memory_info)
+                log "[RESULT] ${killed}個のプロセスを終了 - 空きメモリ: ${new_free}% ($new_info)"
+                notify "✅ memguard" "${killed}個のプロセスを終了しました (空き: ${new_free}%)"
+            fi
+        else
+            log "[INFO] 対象プロセス(claude/node)なし - スキップ"
+        fi
+    fi
+    
+    sleep $CHECK_INTERVAL
+done
